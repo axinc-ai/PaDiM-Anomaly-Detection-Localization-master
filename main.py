@@ -127,17 +127,21 @@ def main():
 
                 # add up mean and covariance matrix
                 mean += torch.sum(embedding_vectors, dim=0).numpy()
+                embedding_vectors = embedding_vectors.numpy()
                 for i in range(H * W):
                     # https://github.com/numpy/numpy/blob/v1.21.0/numpy/lib/function_base.py#L2324-L2543
-                    m = embedding_vectors[:, :, i].numpy()
+                    m = embedding_vectors[:, :, i]
                     m = m - (mean[:, [i]].T / N)
                     cov[:, :, i] += m.T @ m
-            # devide mean and covariance by N or N-1
+            # devide mean by N
             mean = mean / N
+            # devide covariance by N-1, and calculate inverse
+            cov_inv = torch.zeros(C, C, H * W).numpy()
             for i in range(H * W):
                 cov[:, :, i] = (cov[:, :, i] / (N - 1)) + 0.01 * I
+                cov_inv[:, :, i] = np.linalg.inv(cov[:, :, i])
             # save learned distribution
-            train_outputs = [mean, cov]
+            train_outputs = [mean, cov_inv]
             with open(train_feature_filepath, 'wb') as f:
                 pickle.dump(train_outputs, f)
         else:
@@ -181,11 +185,12 @@ def main():
             # calculate distance matrix
             B, C, H, W = embedding_vectors.size()
             embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
-            dist_tmp = np.zeros([B, (H*W)])
+            dist_tmp = np.zeros([B, H * W])
             for i in range(H * W):
-                mean = train_outputs[0][:, i]
-                conv_inv = np.linalg.inv(train_outputs[1][:, :, i])
-                dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
+                mean = train_outputs[0][np.newaxis, :, i].copy()
+                cov_inv = train_outputs[1][:, :, i].copy()
+                feat = embedding_vectors[:, :, i].copy()
+                dist = np.sqrt(np.diag((feat - mean) @ cov_inv @ (feat - mean).T))
                 dist_tmp[:, i] = dist
             dist_list.append(dist_tmp)
 
