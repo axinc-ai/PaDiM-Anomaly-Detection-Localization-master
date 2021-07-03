@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default='D:/dataset/mvtec_anomaly_detection')
     parser.add_argument('--save_path', type=str, default='./mvtec_result')
     parser.add_argument('--arch', type=str, choices=['resnet18', 'wide_resnet50_2'], default='wide_resnet50_2')
+    parser.add_argument('--batch_size', type=int, default=32)
     return parser.parse_args()
 
 
@@ -80,44 +81,61 @@ def main():
     for class_name in mvtec.CLASS_NAMES:
 
         train_dataset = mvtec.MVTecDataset(args.data_path, class_name=class_name, is_train=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=32, pin_memory=True)
+        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True)
         test_dataset = mvtec.MVTecDataset(args.data_path, class_name=class_name, is_train=False)
-        test_dataloader = DataLoader(test_dataset, batch_size=32, pin_memory=True)
+        test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, pin_memory=True)
 
-        train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
-        test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
+        mean = None
+        cov = None
+        I = np.identity(d)
 
         # extract train set features
         train_feature_filepath = os.path.join(args.save_path, 'temp_%s' % args.arch, 'train_%s.pkl' % class_name)
         if not os.path.exists(train_feature_filepath):
+            N = 0
+            # loop of batch
             for (x, _, _) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
+                # initialize hook outputs
+                outputs = []
+                train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
+                # countup N
+                N += len(x)
                 # model prediction
                 with torch.no_grad():
                     _ = model(x.to(device))
                 # get intermediate layer outputs
                 for k, v in zip(train_outputs.keys(), outputs):
                     train_outputs[k].append(v.cpu().detach())
-                # initialize hook outputs
-                outputs = []
-            for k, v in train_outputs.items():
-                train_outputs[k] = torch.cat(v, 0)
+                for k, v in train_outputs.items():
+                    train_outputs[k] = v[0]
 
-            # Embedding concat
-            embedding_vectors = train_outputs['layer1']
-            for layer_name in ['layer2', 'layer3']:
-                embedding_vectors = embedding_concat(embedding_vectors, train_outputs[layer_name])
+                # Embedding concat
+                embedding_vectors = train_outputs['layer1']
+                for layer_name in ['layer2', 'layer3']:
+                    embedding_vectors = embedding_concat(embedding_vectors, train_outputs[layer_name])
 
-            # randomly select d dimension
-            embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
-            # calculate multivariate Gaussian distribution
-            B, C, H, W = embedding_vectors.size()
-            embedding_vectors = embedding_vectors.view(B, C, H * W)
-            mean = torch.mean(embedding_vectors, dim=0).numpy()
-            cov = torch.zeros(C, C, H * W).numpy()
-            I = np.identity(C)
+                # randomly select d dimension
+                embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
+                # calculate multivariate Gaussian distribution
+                B, C, H, W = embedding_vectors.size()
+                embedding_vectors = embedding_vectors.view(B, C, H * W)
+
+                # initialize mean and covariance matrix
+                if (mean is None):
+                    mean = torch.zeros(d, H * W).numpy()
+                    cov = torch.zeros(C, C, H * W).numpy()
+
+                # add up mean and covariance matrix
+                mean += torch.sum(embedding_vectors, dim=0).numpy()
+                for i in range(H * W):
+                    # https://github.com/numpy/numpy/blob/v1.21.0/numpy/lib/function_base.py#L2324-L2543
+                    m = embedding_vectors[:, :, i].numpy()
+                    m = m - (mean[:, [i]].T / N)
+                    cov[:, :, i] += m.T @ m
+            # devide mean and covariance by N or N-1
+            mean = mean / N
             for i in range(H * W):
-                # cov[:, :, i] = LedoitWolf().fit(embedding_vectors[:, :, i].numpy()).covariance_
-                cov[:, :, i] = np.cov(embedding_vectors[:, :, i].numpy(), rowvar=False) + 0.01 * I
+                cov[:, :, i] = (cov[:, :, i] / (N - 1)) + 0.01 * I
             # save learned distribution
             train_outputs = [mean, cov]
             with open(train_feature_filepath, 'wb') as f:
@@ -131,41 +149,48 @@ def main():
         gt_mask_list = []
         test_imgs = []
 
+        N = 0
+        dist_list = []
         # extract test set features
         for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
             test_imgs.extend(x.cpu().detach().numpy())
             gt_list.extend(y.cpu().detach().numpy())
             gt_mask_list.extend(mask.cpu().detach().numpy())
+            # initialize hook outputs
+            outputs = []
+            test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
+            # countup N
+            N += len(x)
             # model prediction
             with torch.no_grad():
                 _ = model(x.to(device))
             # get intermediate layer outputs
             for k, v in zip(test_outputs.keys(), outputs):
                 test_outputs[k].append(v.cpu().detach())
-            # initialize hook outputs
-            outputs = []
-        for k, v in test_outputs.items():
-            test_outputs[k] = torch.cat(v, 0)
+            for k, v in test_outputs.items():
+                test_outputs[k] = v[0]
         
-        # Embedding concat
-        embedding_vectors = test_outputs['layer1']
-        for layer_name in ['layer2', 'layer3']:
-            embedding_vectors = embedding_concat(embedding_vectors, test_outputs[layer_name])
+            # Embedding concat
+            embedding_vectors = test_outputs['layer1']
+            for layer_name in ['layer2', 'layer3']:
+                embedding_vectors = embedding_concat(embedding_vectors, test_outputs[layer_name])
 
-        # randomly select d dimension
-        embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
-        
-        # calculate distance matrix
-        B, C, H, W = embedding_vectors.size()
-        embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
-        dist_list = []
-        for i in range(H * W):
-            mean = train_outputs[0][:, i]
-            conv_inv = np.linalg.inv(train_outputs[1][:, :, i])
-            dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
-            dist_list.append(dist)
+            # randomly select d dimension
+            embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
+            
+            # calculate distance matrix
+            B, C, H, W = embedding_vectors.size()
+            embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
+            dist_tmp = np.zeros([B, (H*W)])
+            for i in range(H * W):
+                mean = train_outputs[0][:, i]
+                conv_inv = np.linalg.inv(train_outputs[1][:, :, i])
+                dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
+                dist_tmp[:, i] = dist
+            dist_list.append(dist_tmp)
 
-        dist_list = np.array(dist_list).transpose(1, 0).reshape(B, H, W)
+        dist_list = np.vstack(dist_list)
+        dist_list = dist_list.reshape(N, H, W)
 
         # upsample
         dist_list = torch.tensor(dist_list)
